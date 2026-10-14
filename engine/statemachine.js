@@ -1,10 +1,6 @@
-#!/usr/bin/env node
-/**
- * statemachine.js — 调和循环状态机核心
- */
-
 const fs = require('fs');
 const path = require('path');
+const { validateOutput } = require('./guardrails.js');
 
 const STATE_FILE = path.join(__dirname, 'state.json');
 const MAX_RETRIES = 2;
@@ -87,6 +83,13 @@ function transition(from, to, extra = {}) {
   if (!allowed.includes(to)) {
     return { ok: false, error: `非法跳步：${from} → ${to} 不被允许。`, allowedTransitions: allowed };
   }
+  // 守卫：如果调用方带了 --validate-step，先校验输出再跳
+  if (extra.validateStep && extra.validateOutput) {
+    const vr = validateOutput(extra.validateStep, extra.validateOutput);
+    if (!vr.ok) {
+      return { ok: false, error: '步骤输出未通过 guardrails 校验', guardrails: vr };
+    }
+  }
   if (to !== STATES.BUDGET_EXCEEDED && to !== STATES.IDLE && to !== STATES.FAILED) {
     const budget = checkBudget(s);
     if (budget.exceeded) {
@@ -110,7 +113,7 @@ function transition(from, to, extra = {}) {
   }
   const prevState = s.state;
   s.state = to;
-  s.history.push({ from: prevState, to, at: now(), step: extra.step, auto: false });
+  s.history.push({ from: prevState, to, at: now(), step: extra.step, auto: false, guardrails: extra.validateStep ? 'passed' : undefined });
   if (extra.goal) { s.goal = extra.goal; s.consumed.startedAt = s.consumed.startedAt || now(); }
   if (extra.subtasks) { s.subtasks = extra.subtasks; }
   if (extra.skillCall) { s.consumed.skillCalls += 1; }
@@ -138,6 +141,8 @@ function main() {
     const stepIdx = args.indexOf('--step');
     const subtaskIdx = args.indexOf('--subtasks');
     const skillCallIdx = args.indexOf('--skill-call');
+    const validateStepIdx = args.indexOf('--validate-step');
+    const validateOutIdx = args.indexOf('--validate-output');
     if (toIdx === -1) { console.log(JSON.stringify({ ok: false, error: '缺少 --to 参数' })); return; }
     const to = args[toIdx + 1];
     const s = loadState();
@@ -146,10 +151,17 @@ function main() {
     if (goalIdx !== -1) { try { extra.goal = JSON.parse(args[goalIdx + 1]); } catch { extra.goal = { summary: args[goalIdx + 1] }; } }
     if (subtaskIdx !== -1) { try { extra.subtasks = JSON.parse(args[subtaskIdx + 1]); } catch { extra.subtasks = []; } }
     if (skillCallIdx !== -1) extra.skillCall = true;
+    if (validateStepIdx !== -1) {
+      extra.validateStep = args[validateStepIdx + 1];
+      if (validateOutIdx !== -1) {
+        try { extra.validateOutput = JSON.parse(args[validateOutIdx + 1]); }
+        catch (e) { console.log(JSON.stringify({ ok: false, error: '--validate-output 不是合法 JSON: ' + e.message })); return; }
+      }
+    }
     console.log(JSON.stringify(transition(s.state, to, extra), null, 2));
     return;
   }
-  console.log(JSON.stringify({ ok: false, error: '未知命令', usage: { current: '查看当前状态', reset: '重置状态机', transition: 'transition' } }, null, 2));
+  console.log(JSON.stringify({ ok: false, error: '未知命令', usage: { current: '查看当前状态', reset: '重置状态机', transition: 'transition', 'transition --validate-step <step> --validate-output <json>': '跳步前先过 guardrails 校验' } }, null, 2));
 }
 
 main();
