@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 /**
  * goal-manager.js — Goal 文档管理器
+ *
+ * 任务状态机：PENDING → (needsApproval ? PENDING_APPROVAL → approve/reject : DONE)
+ * 人介入点参考 Claude Code / OpenAI Agents SDK 的 approval 设计：
+ * 高风险任务（改文件、发请求、花钱）在执行完成前必须人工 approve。
  */
 
 const fs = require('fs');
@@ -12,9 +16,10 @@ const GOAL_FILE = path.join(__dirname, 'goal.md');
 function goalTemplate(data = {}) {
   const now = new Date().toISOString();
   const tasks = (data.tasks || []).map((t, i) => {
-    const icon = t.status === 'DONE' ? '✅' : t.status === 'FAILED' ? '❌' : '⬜';
+    const icon = t.status === 'DONE' ? '✅' : t.status === 'FAILED' ? '❌' : t.status === 'PENDING_APPROVAL' ? '⏸️' : '⬜';
+    const approval = t.needsApproval ? (t.status === 'PENDING_APPROVAL' ? ' [需审批]' : ' [审批过]') : '';
     const evidence = t.evidence ? ` — ${t.evidence}` : '';
-    return `${i + 1}. ${icon} ${t.title} [验收: ${t.acceptance || '未定义'}]${evidence}`;
+    return `${i + 1}. ${icon} ${t.title} [验收: ${t.acceptance || '未定义'}]${approval}${evidence}`;
   }).join('\n');
   const clarity = data.clarity || { score: 0, level: '未知', gaps: [] };
   return `# Goal 文档 — ${data.title || '未命名任务'}\n\n> **状态**: ${data.locked ? '🔒 已锁定（执行中）' : '🔓 可编辑（细化中）'}\n> **创建时间**: ${data.createdAt || now}\n> **最后更新**: ${data.updatedAt || now}\n> **需求明确程度**: ${clarity.score}/100 (${clarity.level})\n\n---\n\n## Goal（最终状态是什么）\n\n${data.goal || '（待填写）'}\n\n## Must Have（必须包含什么）\n\n${data.mustHave || '（待填写）'}\n\n## Must Not Have（明确禁止什么）\n\n${data.mustNotHave || '（待填写）'}\n\n## 验收步骤（怎么判断完成了）\n\n${data.acceptance || '（待填写）'}\n\n## 预算约束\n\n${data.budget || '（待填写）'}\n\n---\n\n## 执行计划\n\n${tasks || '（Goal 锁定后自动生成）'}\n\n---\n\n## 需求明确程度评估\n\n${clarity.gaps && clarity.gaps.length > 0 ? `### 待澄清项 (${clarity.gaps.length})\n${clarity.gaps.map((g, i) => `${i + 1}. ${g}`).join('\n')}` : '### ✅ 所有关键字段已明确'}\n\n---\n\n## 变更历史\n\n${(data.history || []).map(h => `- ${h.at}: ${h.action} — ${h.detail}`).join('\n') || '（无）'}\n`;
@@ -127,13 +132,22 @@ function main() {
   if (cmd === 'add-task') {
     const titleIdx = args.indexOf('--title');
     const acceptanceIdx = args.indexOf('--acceptance');
+    const approvalIdx = args.indexOf('--needs-approval');
     const data = loadGoal();
     if (!data) { console.log(JSON.stringify({ ok: false, error: 'Goal 文档不存在' })); return; }
-    const task = { id: (data.tasks || []).length + 1, title: titleIdx !== -1 ? args[titleIdx + 1] : '未命名任务', acceptance: acceptanceIdx !== -1 ? args[acceptanceIdx + 1] : '', status: 'PENDING', evidence: null, createdAt: now() };
+    const task = {
+      id: (data.tasks || []).length + 1,
+      title: titleIdx !== -1 ? args[titleIdx + 1] : '未命名任务',
+      acceptance: acceptanceIdx !== -1 ? args[acceptanceIdx + 1] : '',
+      needsApproval: approvalIdx !== -1,
+      status: 'PENDING',
+      evidence: null,
+      createdAt: now(),
+    };
     data.tasks = data.tasks || [];
     data.tasks.push(task);
     data.updatedAt = now();
-    data.history.push({ at: now(), action: 'add-task', detail: `添加任务: ${task.title}` });
+    data.history.push({ at: now(), action: 'add-task', detail: `添加任务: ${task.title}${task.needsApproval ? '（需审批）' : ''}` });
     saveGoalDoc(data);
     console.log(JSON.stringify({ ok: true, task, total: data.tasks.length }));
     return;
@@ -146,8 +160,19 @@ function main() {
     const id = parseInt(args[idIdx + 1], 10);
     const task = (data.tasks || []).find(t => t.id === id);
     if (!task) { console.log(JSON.stringify({ ok: false, error: `任务 #${id} 不存在` })); return; }
+    const evidence = evidenceIdx !== -1 ? args[evidenceIdx + 1] : '';
+    if (task.needsApproval && task.status === 'PENDING') {
+      task.status = 'PENDING_APPROVAL';
+      task.evidence = evidence;
+      task.submittedAt = now();
+      data.updatedAt = now();
+      data.history.push({ at: now(), action: 'submit-approval', detail: `提交审批: ${task.title}` });
+      saveGoalDoc(data);
+      console.log(JSON.stringify({ ok: true, status: 'PENDING_APPROVAL', task, message: '任务已提交审批，等待 approve-task / reject-task' }));
+      return;
+    }
     task.status = 'DONE';
-    task.evidence = evidenceIdx !== -1 ? args[evidenceIdx + 1] : '';
+    task.evidence = evidence;
     task.completedAt = now();
     data.updatedAt = now();
     data.history.push({ at: now(), action: 'complete-task', detail: `完成任务: ${task.title}` });
@@ -157,15 +182,53 @@ function main() {
     console.log(JSON.stringify({ ok: true, task, progress: { done, total, allDone: done === total } }));
     return;
   }
+  if (cmd === 'approve-task') {
+    const idIdx = args.indexOf('--id');
+    const data = loadGoal();
+    if (!data) { console.log(JSON.stringify({ ok: false, error: 'Goal 文档不存在' })); return; }
+    const id = parseInt(args[idIdx + 1], 10);
+    const task = (data.tasks || []).find(t => t.id === id);
+    if (!task) { console.log(JSON.stringify({ ok: false, error: `任务 #${id} 不存在` })); return; }
+    if (task.status !== 'PENDING_APPROVAL') { console.log(JSON.stringify({ ok: false, error: `任务 #${id} 当前状态 ${task.status}，不是 PENDING_APPROVAL` })); return; }
+    task.status = 'DONE';
+    task.completedAt = now();
+    data.updatedAt = now();
+    data.history.push({ at: now(), action: 'approve-task', detail: `审批通过: ${task.title}` });
+    saveGoalDoc(data);
+    const done = data.tasks.filter(t => t.status === 'DONE').length;
+    console.log(JSON.stringify({ ok: true, task, progress: { done, total: data.tasks.length } }));
+    return;
+  }
+  if (cmd === 'reject-task') {
+    const idIdx = args.indexOf('--id');
+    const reasonIdx = args.indexOf('--reason');
+    const data = loadGoal();
+    if (!data) { console.log(JSON.stringify({ ok: false, error: 'Goal 文档不存在' })); return; }
+    const id = parseInt(args[idIdx + 1], 10);
+    const task = (data.tasks || []).find(t => t.id === id);
+    if (!task) { console.log(JSON.stringify({ ok: false, error: `任务 #${id} 不存在` })); return; }
+    if (task.status !== 'PENDING_APPROVAL') { console.log(JSON.stringify({ ok: false, error: `任务 #${id} 当前状态 ${task.status}，不是 PENDING_APPROVAL` })); return; }
+    task.status = 'PENDING';
+    task.rejectedAt = now();
+    task.rejectReason = reasonIdx !== -1 ? args[reasonIdx + 1] : '';
+    data.updatedAt = now();
+    data.history.push({ at: now(), action: 'reject-task', detail: `驳回: ${task.title}${task.rejectReason ? ' — ' + task.rejectReason : ''}` });
+    saveGoalDoc(data);
+    console.log(JSON.stringify({ ok: true, task, message: '已驳回，回到 PENDING 待重新执行' }));
+    return;
+  }
   if (cmd === 'progress') {
     const data = loadGoal();
     if (!data) { console.log(JSON.stringify({ ok: false, error: 'Goal 文档不存在' })); return; }
     const done = (data.tasks || []).filter(t => t.status === 'DONE').length;
+    const pendingApproval = (data.tasks || []).filter(t => t.status === 'PENDING_APPROVAL').length;
     const total = (data.tasks || []).length;
-    console.log(JSON.stringify({ ok: true, title: data.title, locked: data.locked, clarity: data.clarity, progress: { done, total, allDone: done === total && total > 0 } }, null, 2));
+    console.log(JSON.stringify({ ok: true, title: data.title, locked: data.locked, clarity: data.clarity, progress: { done, pendingApproval, total, allDone: done === total && total > 0 } }, null, 2));
     return;
   }
-  console.log(JSON.stringify({ ok: false, error: '未知命令', usage: { init: 'init', refine: 'refine', assess: 'assess', show: 'show', lock: 'lock', unlock: 'unlock', 'add-task': 'add-task', 'complete-task': 'complete-task', progress: 'progress' } }, null, 2));
+  console.log(JSON.stringify({ ok: false, error: '未知命令', usage: { init: 'init', refine: 'refine', assess: 'assess', show: 'show', lock: 'lock', unlock: 'unlock', 'add-task': 'add-task [--needs-approval]', 'complete-task': 'complete-task --id N [--evidence "..."]', 'approve-task': 'approve-task --id N', 'reject-task': 'reject-task --id N [--reason "..."]', progress: 'progress' } }, null, 2));
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { goalTemplate, assessClarity };
