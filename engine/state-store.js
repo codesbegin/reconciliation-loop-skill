@@ -5,6 +5,8 @@
  * 2026-10-12 新增 update-patch 命令：
  * 用 JSON patch 局部更新 state，避免整体覆盖时误清空其他字段。
  * 参考 LangGraph 的 reducer 思路。
+ *
+ * 2026-10-17：把 patch 逻辑抽成纯函数 applyPatchToState，方便单元测试。
  */
 
 const fs = require('fs');
@@ -14,6 +16,22 @@ const STATE_FILE = path.join(__dirname, 'state.json');
 
 // 允许 patch 写入的顶层字段白名单，防止 LLM 意外覆盖 budget 等结构
 const PATCHABLE_FIELDS = new Set(['state', 'goal', 'subtasks', 'history', 'retryCount', 'consumed', 'goalDoc']);
+
+/**
+ * 把 patch 应用到 state 上，白名单之外的字段直接拒绝并返回 rejected 列表。
+ * 纯函数：不做 IO，不写文件。
+ */
+function applyPatchToState(state, patch) {
+  const applied = [];
+  const rejected = [];
+  const next = { ...state };
+  for (const key of Object.keys(patch)) {
+    if (!PATCHABLE_FIELDS.has(key)) { rejected.push(key); continue; }
+    next[key] = patch[key];
+    applied.push(key);
+  }
+  return { next, applied, rejected };
+}
 
 function load() {
   if (!fs.existsSync(STATE_FILE)) {
@@ -90,13 +108,9 @@ function main() {
     let patch;
     try { patch = JSON.parse(patchStr); } catch (e) { console.log(JSON.stringify({ ok: false, error: 'patch JSON 解析失败: ' + e.message })); return; }
     const s = load();
-    const rejected = [];
-    for (const key of Object.keys(patch)) {
-      if (!PATCHABLE_FIELDS.has(key)) { rejected.push(key); continue; }
-      s[key] = patch[key];
-    }
-    save(s);
-    console.log(JSON.stringify({ ok: rejected.length === 0, applied: Object.keys(patch).filter(k => !rejected.includes(k)), rejected, state: s.state }));
+    const { next, applied, rejected } = applyPatchToState(s, patch);
+    save(next);
+    console.log(JSON.stringify({ ok: rejected.length === 0, applied, rejected, state: next.state }));
     return;
   }
 
@@ -114,4 +128,6 @@ function main() {
   console.log(JSON.stringify({ ok: false, error: '未知命令' }, null, 2));
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { PATCHABLE_FIELDS, applyPatchToState };
