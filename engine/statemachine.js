@@ -40,21 +40,19 @@ const BUDGET_STOP_STATES = [STATES.ANALYZING, STATES.REFINING_GOAL, STATES.EXECU
 
 const TERMINAL_STATES = [STATES.DONE, STATES.FAILED, STATES.BUDGET_EXCEEDED];
 
-function loadState() {
-  if (!fs.existsSync(STATE_FILE)) {
-    return { state: STATES.IDLE, goal: null, subtasks: [], history: [], retryCount: { current: 0, max: MAX_RETRIES }, budget: { maxRounds: 10, maxSkillCalls: 20, maxMinutes: 120 }, consumed: { rounds: 0, skillCalls: 0, startedAt: null } };
+/**
+ * 判断 from → to 是否合法（不读文件、不写文件）。
+ * 在 BUDGET_STOP_STATES 中时，允许额外跳到 BUDGET_EXCEEDED。
+ */
+function isTransitionAllowed(from, to) {
+  const allowed = [...(TRANSITIONS[from] || [])];
+  if (BUDGET_STOP_STATES.includes(from) && to !== STATES.BUDGET_EXCEEDED) {
+    allowed.push(STATES.BUDGET_EXCEEDED);
   }
-  return JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
+  return allowed.includes(to);
 }
 
-function saveState(data) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(data, null, 2), 'utf-8');
-}
-
-function now() {
-  return new Date().toISOString();
-}
-
+/** 预算检查（纯函数）。 */
 function checkBudget(s) {
   if (s.budget.maxRounds > 0 && s.consumed.rounds >= s.budget.maxRounds) {
     return { exceeded: true, reason: `已用轮数 ${s.consumed.rounds}/${s.budget.maxRounds}，超出预算` };
@@ -71,17 +69,28 @@ function checkBudget(s) {
   return { exceeded: false };
 }
 
+function loadState() {
+  if (!fs.existsSync(STATE_FILE)) {
+    return { state: STATES.IDLE, goal: null, subtasks: [], history: [], retryCount: { current: 0, max: MAX_RETRIES }, budget: { maxRounds: 10, maxSkillCalls: 20, maxMinutes: 120 }, consumed: { rounds: 0, skillCalls: 0, startedAt: null } };
+  }
+  return JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
+}
+
+function saveState(data) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(data, null, 2), 'utf-8');
+}
+
+function now() {
+  return new Date().toISOString();
+}
+
 function transition(from, to, extra = {}) {
   const s = loadState();
   if (s.state !== from) {
     return { ok: false, error: `当前状态是 ${s.state}，不是 ${from}。请先运行 'node engine/statemachine.js current' 确认。` };
   }
-  const allowed = [...(TRANSITIONS[from] || [])];
-  if (BUDGET_STOP_STATES.includes(from) && to !== STATES.BUDGET_EXCEEDED) {
-    allowed.push(STATES.BUDGET_EXCEEDED);
-  }
-  if (!allowed.includes(to)) {
-    return { ok: false, error: `非法跳步：${from} → ${to} 不被允许。`, allowedTransitions: allowed };
+  if (!isTransitionAllowed(from, to)) {
+    return { ok: false, error: `非法跳步：${from} → ${to} 不被允许。`, allowedTransitions: TRANSITIONS[from] || [] };
   }
   // 守卫：如果调用方带了 --validate-step，先校验输出再跳
   if (extra.validateStep && extra.validateOutput) {
@@ -164,4 +173,13 @@ function main() {
   console.log(JSON.stringify({ ok: false, error: '未知命令', usage: { current: '查看当前状态', reset: '重置状态机', transition: 'transition', 'transition --validate-step <step> --validate-output <json>': '跳步前先过 guardrails 校验' } }, null, 2));
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = {
+  STATES,
+  TRANSITIONS,
+  BUDGET_STOP_STATES,
+  TERMINAL_STATES,
+  checkBudget,
+  isTransitionAllowed,
+};
